@@ -1,10 +1,11 @@
+use std::env;
 use calamine::{Reader, open_workbook, Xlsx};
 use polars::prelude::*;
 use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Open the Excel file
-    let path = "Беркут.xlsx";
+    let args: Vec<String> = env::args().collect();
+    let path = &args[1];
     let mut workbook: Xlsx<_> = open_workbook(path)?;
 
     // Select worksheet
