@@ -5,7 +5,15 @@ edition = "2024"
 
 [dependencies]
 calamine = "0.27.0"
+clap = "4.5.37"
 polars = "0.47.1"
+tempfile = "3.19.1"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 clippy = "0.0.302"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
