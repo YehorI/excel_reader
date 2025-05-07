@@ -1,6 +1,7 @@
 use clap::{Command, Arg};
 use calamine::{Data, Range, Reader, Xlsx, open_workbook};
 use polars::prelude::*;
+use rayon::prelude::*;
 use polars::error::PolarsError;
 use std::error::Error;
 
@@ -35,15 +36,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get_one::<String>("worksheet")
         .map(|s| s.as_str())
     };
-    let header_number = {
-        matches
-        .get_one::<String>("header")
-        .map(|s| u8::from_str_radix(s, 10))
-        .transpose()?
-    };
+    let header_rows = matches
+    .get_one::<String>("header")
+    .map(|s| {
+        s.split(',')
+            .map(|v| v.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .transpose()?;
 
     // Use the arguments from CLI
-    let df = process_excel_worksheet(path, worksheet, header_number)?;
+    let df = process_excel_worksheet(path, worksheet, header_rows)?;
     println!("{}", df.head(Some(10)));
     Ok(())
 }
@@ -52,25 +55,52 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn process_excel_worksheet(
     path: &str,
     worksheet_name: Option<&str>,
-    header_number: Option<u8>
+    header_rows: Option<Vec<usize>>, // <-- modified type
 ) -> Result<DataFrame, Box<dyn Error>> {
     let range = get_worksheet_range(path, worksheet_name)?;
+    let header_rows = header_rows.unwrap_or(vec![0]);
 
-    let header_number = header_number.unwrap_or(0) as usize;
     let rows: Vec<Vec<Data>> = range.rows().map(|row| row.to_vec()).collect();
-
-    // Ensure the header row exists
-    if header_number >= rows.len() {
-        return Err("Header row index is out of bounds".into());
+    // Check header indices are in bounds
+    for &idx in &header_rows {
+        if idx >= rows.len() {
+            return Err("One of header row indices is out of bounds".into());
+        }
     }
 
-    // Extract header and data using the specified header row
-    let headers = extract_headers(&rows[header_number])?;
-    let data_rows = &rows[header_number + 1..];
-    let data = extract_data(data_rows, headers.len());
+    // Collect header rows
+    let header_cells: Vec<&[Data]> = header_rows.iter().map(|&i| &rows[i][..]).collect();
+    // Collapse headers
+    let headers = collapse_multi_headers(&header_cells)?;
 
+    // Data starts after the last header row
+    let data_start = header_rows.iter().max().map(|x| x+1).unwrap_or(1);
+    let data_rows = &rows[data_start..];
+    let data = extract_data(data_rows, headers.len());
     let df = create_dataframe(headers, data)?;
     Ok(df)
+}
+
+
+fn collapse_multi_headers(header_cells: &Vec<&[Data]>) -> Result<Vec<String>, Box<dyn Error>> {
+    if header_cells.is_empty() {
+        return Err("Empty header cells".into());
+    }
+    let cols = header_cells[0].len();
+    let mut collapsed = Vec::with_capacity(cols);
+    for col_idx in 0..cols {
+        let parts: Vec<String> = header_cells.iter()
+            .map(|row| row.get(col_idx).map(|d| d.to_string()).unwrap_or_default())
+            .filter(|part| !part.starts_with("Unnamed") && !part.trim().is_empty())
+            .collect();
+
+        collapsed.push(if parts.is_empty() {
+            format!("Unnamed_{}", col_idx)
+        } else {
+            parts.join(" ")
+        });
+    }
+    Ok(collapsed)
 }
 
 
@@ -93,14 +123,6 @@ fn get_worksheet_range(path: &str, worksheet_name: Option<&str>) -> Result<Range
     };
 
     Ok(range)
-}
-
-
-fn extract_headers(header_row: &[Data]) -> Result<Vec<String>, Box<dyn Error>> {
-    if header_row.is_empty() {
-        return Err("Header row is empty".into());
-    }
-    Ok(header_row.iter().map(|cell| cell.to_string()).collect())
 }
 
 
@@ -179,13 +201,15 @@ fn process_headers(headers: Vec<String>) -> Vec<String> {
 
 
 fn create_dataframe(headers: Vec<String>, data: Vec<Vec<String>>) -> Result<DataFrame, PolarsError> {
-    let mut columns = Vec::with_capacity(headers.len());
     let headers = process_headers(headers);
-    for (i, header) in headers.iter().enumerate() {
-        let series_data: Vec<&str> = data.iter().map(|row| row[i].as_str()).collect();
-        let series = Series::new(header.into(), series_data);
-        columns.push(series.into());
-    }
+    let columns: Vec<Column> = (0..headers.len())
+        .into_par_iter()
+        .map(|i| {
+            let col_data: Vec<&str> = data.iter().map(|row| row[i].as_str()).collect();
+            let series = Series::new(headers[i].clone().into(), &col_data);
+            series.into()
+        })
+        .collect();
     Ok(DataFrame::new(columns)?)
 }
 
